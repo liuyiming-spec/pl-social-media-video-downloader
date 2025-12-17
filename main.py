@@ -382,15 +382,22 @@ def update_bq_table_2(payload: Dict[str, Any], video_public_url: str) -> None:
     - 用 BQ2_KEY_FIELD 定位行
     - 更新 BQ2_UPDATE_FIELD（默认 resaved_video_path）为 video_public_url
 
-    这里用 UPDATE（不会新增行），更符合“回填你的原有爬取数据表字段”的场景。
+    用 MERGE（只 UPDATE MATCHED，不插入），避免 UPDATE 扫描/并发时更容易超时的问题。
     """
-    key_val = _get_key_val(payload, BQ2_KEY_FIELD)
+    key_val = _get_key_val(payload, BQ_KEY_FIELD)
     table2_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_2}"
 
     query = f"""
-    UPDATE `{table2_id}`
-    SET {BQ2_UPDATE_FIELD} = @video_public_url
-    WHERE uuid = @key_val
+    MERGE `{table2_id}` T
+    USING (
+      SELECT
+        @key_val AS {BQ2_KEY_FIELD},
+        @video_public_url AS {BQ2_UPDATE_FIELD}
+    ) S
+    ON T.{BQ2_KEY_FIELD} = S.{BQ2_KEY_FIELD}
+    WHEN MATCHED THEN
+      UPDATE SET
+        {BQ2_UPDATE_FIELD} = S.{BQ2_UPDATE_FIELD}
     """
 
     job_config = bigquery.QueryJobConfig(
@@ -401,6 +408,7 @@ def update_bq_table_2(payload: Dict[str, Any], video_public_url: str) -> None:
     )
 
     bq_client.query(query, job_config=job_config).result()
+
 
 
 def parse_pubsub_push(req_json: Dict[str, Any]) -> Dict[str, Any]:
