@@ -384,7 +384,7 @@ def update_bq_table_2(payload: Dict[str, Any], video_public_url: str) -> None:
 
     用 MERGE（只 UPDATE MATCHED，不插入），避免 UPDATE 扫描/并发时更容易超时的问题。
     """
-    key_val = _get_key_val(payload, BQ_KEY_FIELD)
+    key_val = _get_key_val(payload, BQ2_KEY_FIELD)
     table2_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_2}"
 
     query = f"""
@@ -408,6 +408,7 @@ def update_bq_table_2(payload: Dict[str, Any], video_public_url: str) -> None:
     )
 
     bq_client.query(query, job_config=job_config).result()
+
 
 
 
