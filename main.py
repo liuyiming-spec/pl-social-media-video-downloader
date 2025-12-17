@@ -305,23 +305,20 @@ def upsert_bigquery(
     error: Optional[str] = None,
 ) -> None:
     """
-    将处理结果写回 BigQuery（BQ_TABLE），用 MERGE 实现幂等与可重试。
-
-    兼容策略：
-    - 通用字段：media_type/raw_url/gcs_uri/public_url/content_type/status/author/src_timestamp/error/updated_at
-    - 视频专用字段：raw_video_url/video_public_url（保持兼容）
-    - 图片专用字段：raw_image_url/image_public_url
+    新逻辑：只保留一套字段（不再写 raw_video_url/raw_image_url/video_public_url/image_public_url）
+    表字段：
+      {BQ_KEY_FIELD}, media_type, source_url, gcs_uri, public_url, content_type,
+      status, author, src_timestamp, error, updated_at
     """
     key_val = _get_key_val(payload, BQ_KEY_FIELD)
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
-    # 原始 URL：兼容多种字段名
-    raw_video_url = str(payload.get("video_url") or payload.get("videoUrl") or "")
-    raw_image_url = str(payload.get("image_url") or payload.get("imageUrl") or payload.get("img_url") or "")
-    raw_url = str(payload.get("media_url") or (raw_video_url if media_type == "video" else raw_image_url) or "")
-
-    video_public_url = public_url if media_type == "video" else ""
-    image_public_url = public_url if media_type == "image" else ""
+    # 统一 source_url：优先 media_url，否则按 type 取 image_url/video_url
+    source_url = (
+        payload.get("media_url")
+        or (payload.get("image_url") if media_type == "image" else payload.get("video_url"))
+        or ""
+    )
 
     query = f"""
     MERGE `{table_id}` T
@@ -329,21 +326,10 @@ def upsert_bigquery(
       SELECT
         @key_val AS {BQ_KEY_FIELD},
         @media_type AS media_type,
-
-        -- 通用
-        @raw_url AS raw_url,
+        @source_url AS source_url,
         @gcs_uri AS gcs_uri,
         @public_url AS public_url,
         @content_type AS content_type,
-
-        -- 视频兼容字段
-        @raw_video_url AS raw_video_url,
-        @video_public_url AS video_public_url,
-
-        -- 图片字段
-        @raw_image_url AS raw_image_url,
-        @image_public_url AS image_public_url,
-
         @status AS status,
         @author AS author,
         @src_timestamp AS src_timestamp,
@@ -353,46 +339,42 @@ def upsert_bigquery(
     ON T.{BQ_KEY_FIELD} = S.{BQ_KEY_FIELD}
     WHEN MATCHED THEN
       UPDATE SET
-        media_type = S.media_type,
-
-        raw_url = S.raw_url,
-        gcs_uri = S.gcs_uri,
-        public_url = S.public_url,
+        media_type   = S.media_type,
+        source_url   = S.source_url,
+        gcs_uri      = S.gcs_uri,
+        public_url   = S.public_url,
         content_type = S.content_type,
-
-        raw_video_url = S.raw_video_url,
-        video_public_url = S.video_public_url,
-
-        raw_image_url = S.raw_image_url,
-        image_public_url = S.image_public_url,
-
-        status = S.status,
-        author = S.author,
-        src_timestamp = S.src_timestamp,
-        error = S.error,
-        updated_at = S.updated_at
+        status       = S.status,
+        author       = S.author,
+        src_timestamp= S.src_timestamp,
+        error        = S.error,
+        updated_at   = S.updated_at
     WHEN NOT MATCHED THEN
       INSERT (
         {BQ_KEY_FIELD},
         media_type,
-
-        raw_url, gcs_uri, public_url, content_type,
-
-        raw_video_url, video_public_url,
-        raw_image_url, image_public_url,
-
-        status, author, src_timestamp, error, updated_at
+        source_url,
+        gcs_uri,
+        public_url,
+        content_type,
+        status,
+        author,
+        src_timestamp,
+        error,
+        updated_at
       )
       VALUES (
         S.{BQ_KEY_FIELD},
         S.media_type,
-
-        S.raw_url, S.gcs_uri, S.public_url, S.content_type,
-
-        S.raw_video_url, S.video_public_url,
-        S.raw_image_url, S.image_public_url,
-
-        S.status, S.author, S.src_timestamp, S.error, S.updated_at
+        S.source_url,
+        S.gcs_uri,
+        S.public_url,
+        S.content_type,
+        S.status,
+        S.author,
+        S.src_timestamp,
+        S.error,
+        S.updated_at
       )
     """
 
@@ -400,18 +382,10 @@ def upsert_bigquery(
         query_parameters=[
             bigquery.ScalarQueryParameter("key_val", "STRING", str(key_val)),
             bigquery.ScalarQueryParameter("media_type", "STRING", media_type),
-
-            bigquery.ScalarQueryParameter("raw_url", "STRING", raw_url),
+            bigquery.ScalarQueryParameter("source_url", "STRING", str(source_url)),
             bigquery.ScalarQueryParameter("gcs_uri", "STRING", gcs_uri or ""),
             bigquery.ScalarQueryParameter("public_url", "STRING", public_url or ""),
             bigquery.ScalarQueryParameter("content_type", "STRING", content_type or ""),
-
-            bigquery.ScalarQueryParameter("raw_video_url", "STRING", raw_video_url),
-            bigquery.ScalarQueryParameter("video_public_url", "STRING", video_public_url),
-
-            bigquery.ScalarQueryParameter("raw_image_url", "STRING", raw_image_url),
-            bigquery.ScalarQueryParameter("image_public_url", "STRING", image_public_url),
-
             bigquery.ScalarQueryParameter("status", "STRING", status),
             bigquery.ScalarQueryParameter("author", "STRING", str(payload.get("author") or "")),
             bigquery.ScalarQueryParameter("src_timestamp", "STRING", str(payload.get("timestamp") or "")),
@@ -420,6 +394,7 @@ def upsert_bigquery(
     )
 
     bq_client.query(query, job_config=job_config).result()
+
 
 
 def parse_pubsub_push(req_json: Dict[str, Any]) -> Dict[str, Any]:
