@@ -313,7 +313,7 @@ def upsert_bigquery(
     payload: Dict[str, Any],
     gcs_uri: str,
     status: str,
-    vedio_public_url: str,
+    video_public_url: str,
     error: Optional[str] = None,
 ) -> None:
     """
@@ -322,7 +322,7 @@ def upsert_bigquery(
     - 无记录：INSERT
     用 MERGE 实现幂等与“可重试”。
 
-    新增字段：vedio_public_url（按你的字段名拼写）
+    新增字段：video_public_url（按你的字段名拼写）
     """
     key_val = _get_key_val(payload, BQ_KEY_FIELD)
 
@@ -338,7 +338,7 @@ def upsert_bigquery(
         @status AS status,
         @author AS author,
         @src_timestamp AS src_timestamp,
-        @vedio_public_url AS vedio_public_url,
+        @video_public_url AS video_public_url,
         @error AS error,
         CURRENT_TIMESTAMP() AS updated_at
     ) S
@@ -350,12 +350,12 @@ def upsert_bigquery(
         status = S.status,
         author = S.author,
         src_timestamp = S.src_timestamp,
-        vedio_public_url = S.vedio_public_url,
+        video_public_url = S.video_public_url,
         error = S.error,
         updated_at = S.updated_at
     WHEN NOT MATCHED THEN
-      INSERT ({BQ_KEY_FIELD}, raw_video_url, gcs_uri, status, author, src_timestamp, vedio_public_url, error, updated_at)
-      VALUES (S.{BQ_KEY_FIELD}, S.raw_video_url, S.gcs_uri, S.status, S.author, S.src_timestamp, S.vedio_public_url, S.error, S.updated_at)
+      INSERT ({BQ_KEY_FIELD}, raw_video_url, gcs_uri, status, author, src_timestamp, video_public_url, error, updated_at)
+      VALUES (S.{BQ_KEY_FIELD}, S.raw_video_url, S.gcs_uri, S.status, S.author, S.src_timestamp, S.video_public_url, S.error, S.updated_at)
     """
 
     job_config = bigquery.QueryJobConfig(
@@ -368,7 +368,7 @@ def upsert_bigquery(
             bigquery.ScalarQueryParameter("status", "STRING", status),
             bigquery.ScalarQueryParameter("author", "STRING", str(payload.get("author") or "")),
             bigquery.ScalarQueryParameter("src_timestamp", "STRING", str(payload.get("timestamp") or "")),
-            bigquery.ScalarQueryParameter("vedio_public_url", "STRING", vedio_public_url or ""),
+            bigquery.ScalarQueryParameter("video_public_url", "STRING", video_public_url or ""),
             bigquery.ScalarQueryParameter("error", "STRING", error or ""),
         ]
     )
@@ -376,11 +376,11 @@ def upsert_bigquery(
     bq_client.query(query, job_config=job_config).result()
 
 
-def update_bq_table_2(payload: Dict[str, Any], vedio_public_url: str) -> None:
+def update_bq_table_2(payload: Dict[str, Any], video_public_url: str) -> None:
     """
     将处理结果写入/更新 BQ_TABLE_2：
     - 用 BQ2_KEY_FIELD 定位行
-    - 更新 BQ2_UPDATE_FIELD（默认 resaved_video_path）为 vedio_public_url
+    - 更新 BQ2_UPDATE_FIELD（默认 resaved_video_path）为 video_public_url
 
     这里用 UPDATE（不会新增行），更符合“回填你的原有爬取数据表字段”的场景。
     """
@@ -389,14 +389,14 @@ def update_bq_table_2(payload: Dict[str, Any], vedio_public_url: str) -> None:
 
     query = f"""
     UPDATE `{table2_id}`
-    SET {BQ2_UPDATE_FIELD} = @vedio_public_url
-    WHERE {BQ2_KEY_FIELD} = @key_val
+    SET {BQ2_UPDATE_FIELD} = @video_public_url
+    WHERE uuid = @key_val
     """
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("key_val", "STRING", str(key_val)),
-            bigquery.ScalarQueryParameter("vedio_public_url", "STRING", vedio_public_url or ""),
+            bigquery.ScalarQueryParameter("video_public_url", "STRING", video_public_url or ""),
         ]
     )
 
@@ -453,25 +453,25 @@ def pubsub_push():
 
             # 永久失败：写入 BQ_TABLE failed，并 ack
             if not up.get("ok"):
-                upsert_bigquery(payload, gcs_uri="", status="failed", vedio_public_url="", error=up.get("error"))
+                upsert_bigquery(payload, gcs_uri="", status="failed", video_public_url="", error=up.get("error"))
                 return jsonify({"ok": True, "status": "failed", "error": up.get("error")}), 200
 
             gcs_uri = up["gcs_uri"]
             final_object_name = up.get("object_name") or object_name
 
             # 新增：生成公网 URL（格式）
-            vedio_public_url = _gcs_public_url(GCS_BUCKET, final_object_name)
+            video_public_url = _gcs_public_url(GCS_BUCKET, final_object_name)
 
             status = "done" if not up.get("skipped") else "done_skipped"
 
-            # 1) 写回 BQ_TABLE：新增 vedio_public_url 字段
-            upsert_bigquery(payload, gcs_uri=gcs_uri, status=status, vedio_public_url=vedio_public_url, error="")
+            # 1) 写回 BQ_TABLE：新增 video_public_url 字段
+            upsert_bigquery(payload, gcs_uri=gcs_uri, status=status, video_public_url=video_public_url, error="")
 
             # 2) 写回 BQ_TABLE_2：用主键更新 resaved_video_path（或你配置的字段）
-            update_bq_table_2(payload, vedio_public_url=vedio_public_url)
+            update_bq_table_2(payload, video_public_url=video_public_url)
 
             return jsonify(
-                {"ok": True, "status": status, "gcs_uri": gcs_uri, "vedio_public_url": vedio_public_url}
+                {"ok": True, "status": status, "gcs_uri": gcs_uri, "video_public_url": video_public_url}
             ), 200
 
         except (TooManyRequests, ServiceUnavailable) as e:
