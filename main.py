@@ -6,6 +6,7 @@ import os
 import random
 import time
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 # 第三方：requests 用于拉取视频流；Flask 用来做 Cloud Run 的 HTTP 服务入口
 import requests
@@ -36,10 +37,20 @@ BQ_PROJECT = os.environ["BQ_PROJECT"]
 BQ_DATASET = os.environ["BQ_DATASET"]
 
 # BigQuery 表名（必须）
-BQ_TABLE   = os.environ["BQ_TABLE"]
+BQ_TABLE = os.environ["BQ_TABLE"]
 
 # BigQuery 的主键字段名（可选；默认 post_id；用于 MERGE 的 ON 条件）
 BQ_KEY_FIELD = os.getenv("BQ_KEY_FIELD", "post_id")
+
+# ===== 新增：第二张表（你的爬取数据表，用来回填 resaved_video_path） =====
+# 第二张 BigQuery 表名（必须：因为你明确要写入另外一张表）
+BQ_TABLE_2 = os.environ["BQ_TABLE_2"]
+
+# 第二张表的主键字段名（可选；默认沿用 BQ_KEY_FIELD）
+BQ2_KEY_FIELD = os.getenv("BQ2_KEY_FIELD", BQ_KEY_FIELD)
+
+# 第二张表被更新的字段名（可选；默认 resaved_video_path）
+BQ2_UPDATE_FIELD = os.getenv("BQ2_UPDATE_FIELD", "resaved_video_path")
 
 # 可选：简单共享密钥，用于防止别的来源直接调用你的 endpoint（生产建议用 OIDC/IAM 更标准）
 SHARED_SECRET = os.getenv("SHARED_SECRET")
@@ -132,6 +143,24 @@ def _infer_ext(content_type: Optional[str]) -> str:
     return ".mp4"
 
 
+def _gcs_public_url(bucket: str, object_name: str) -> str:
+    """
+    生成 GCS 的公网 URL 形式（不保证一定可访问，取决于 bucket/object ACL/IAM）。
+    使用 storage.googleapis.com 形式，并对 object_name 做 URL 编码，但保留路径分隔符。
+    """
+    return f"https://storage.googleapis.com/{bucket}/{quote(object_name, safe='/')}"
+
+
+def _get_key_val(payload: Dict[str, Any], key_field: str) -> str:
+    """
+    统一取主键值：优先 payload[key_field]，再 fallback 到 post_id/shortcode/id，再兜底 url hash。
+    """
+    key_val = payload.get(key_field) or payload.get("post_id") or payload.get("shortcode") or payload.get("id")
+    if not key_val:
+        key_val = f"noid-{abs(hash(payload.get('video_url', '')))}"
+    return str(key_val)
+
+
 def build_object_name(payload: Dict[str, Any]) -> str:
     """
     根据 payload 构造 GCS 对象路径（核心：幂等 + 可追踪）。
@@ -195,7 +224,7 @@ def http_get_stream(url: str) -> Tuple[requests.Response, str]:
 def upload_stream_to_gcs(video_url: str, object_name: str) -> Dict[str, Any]:
     """
     从 video_url 以流方式下载，并以流方式上传到 GCS。
-    返回 {ok, gcs_uri, skipped, ...}。
+    返回 {ok, gcs_uri, skipped, object_name, ...}。
     """
     # 获取 bucket 对象
     bucket = storage_client.bucket(GCS_BUCKET)
@@ -269,33 +298,36 @@ def upload_stream_to_gcs(video_url: str, object_name: str) -> Dict[str, Any]:
         # 无论成功/失败，都要关闭响应，释放连接
         r.close()
 
-    # 返回上传结果，包含 gs:// 路径
+    # 返回上传结果，包含 gs:// 路径 + 最终 object_name（用于生成公网 URL）
     return {
         "ok": True,
         "skipped": skipped,
         "reason": reason,
         "gcs_uri": f"gs://{GCS_BUCKET}/{object_name}",
+        "object_name": object_name,
         "content_type": content_type,
     }
 
 
-def upsert_bigquery(payload: Dict[str, Any], gcs_uri: str, status: str, error: Optional[str] = None) -> None:
+def upsert_bigquery(
+    payload: Dict[str, Any],
+    gcs_uri: str,
+    status: str,
+    vedio_public_url: str,
+    error: Optional[str] = None,
+) -> None:
     """
-    将处理结果写回 BigQuery：
+    将处理结果写回 BigQuery（BQ_TABLE）：
     - 有记录：UPDATE
     - 无记录：INSERT
     用 MERGE 实现幂等与“可重试”。
-    """
-    # 拿到主键值（优先使用你配置的 BQ_KEY_FIELD，否则 fallback 到 post_id/shortcode/id）
-    key_val = payload.get(BQ_KEY_FIELD) or payload.get("post_id") or payload.get("shortcode") or payload.get("id")
-    # 如果仍没有 key，则用 url hash 兜底（建议上游一定给 post_id）
-    if not key_val:
-        key_val = f"noid-{abs(hash(payload.get('video_url', '')))}"
 
-    # 拼 BigQuery 目标表标识
+    新增字段：vedio_public_url（按你的字段名拼写）
+    """
+    key_val = _get_key_val(payload, BQ_KEY_FIELD)
+
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
-    # 用 MERGE：匹配则更新，不匹配则插入（避免重复写多行）
     query = f"""
     MERGE `{table_id}` T
     USING (
@@ -306,6 +338,7 @@ def upsert_bigquery(payload: Dict[str, Any], gcs_uri: str, status: str, error: O
         @status AS status,
         @author AS author,
         @src_timestamp AS src_timestamp,
+        @vedio_public_url AS vedio_public_url,
         @error AS error,
         CURRENT_TIMESTAMP() AS updated_at
     ) S
@@ -317,34 +350,56 @@ def upsert_bigquery(payload: Dict[str, Any], gcs_uri: str, status: str, error: O
         status = S.status,
         author = S.author,
         src_timestamp = S.src_timestamp,
+        vedio_public_url = S.vedio_public_url,
         error = S.error,
         updated_at = S.updated_at
     WHEN NOT MATCHED THEN
-      INSERT ({BQ_KEY_FIELD}, raw_video_url, gcs_uri, status, author, src_timestamp, error, updated_at)
-      VALUES (S.{BQ_KEY_FIELD}, S.raw_video_url, S.gcs_uri, S.status, S.author, S.src_timestamp, S.error, S.updated_at)
+      INSERT ({BQ_KEY_FIELD}, raw_video_url, gcs_uri, status, author, src_timestamp, vedio_public_url, error, updated_at)
+      VALUES (S.{BQ_KEY_FIELD}, S.raw_video_url, S.gcs_uri, S.status, S.author, S.src_timestamp, S.vedio_public_url, S.error, S.updated_at)
     """
 
-    # 配置参数化查询（避免 SQL 注入，也更稳定）
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            # 主键
             bigquery.ScalarQueryParameter("key_val", "STRING", str(key_val)),
-            # 源视频链接（actor 的直链）
-            bigquery.ScalarQueryParameter("raw_video_url", "STRING", str(payload.get("video_url") or payload.get("videoUrl") or "")),
-            # GCS 结果
+            bigquery.ScalarQueryParameter(
+                "raw_video_url", "STRING", str(payload.get("video_url") or payload.get("videoUrl") or "")
+            ),
             bigquery.ScalarQueryParameter("gcs_uri", "STRING", gcs_uri or ""),
-            # 状态
             bigquery.ScalarQueryParameter("status", "STRING", status),
-            # 作者
             bigquery.ScalarQueryParameter("author", "STRING", str(payload.get("author") or "")),
-            # 原始时间戳（先当 STRING 写入；你也可以改成 TIMESTAMP）
             bigquery.ScalarQueryParameter("src_timestamp", "STRING", str(payload.get("timestamp") or "")),
-            # 错误信息
+            bigquery.ScalarQueryParameter("vedio_public_url", "STRING", vedio_public_url or ""),
             bigquery.ScalarQueryParameter("error", "STRING", error or ""),
         ]
     )
 
-    # 执行查询并等待完成（result() 会阻塞到 MERGE 执行完成）
+    bq_client.query(query, job_config=job_config).result()
+
+
+def update_bq_table_2(payload: Dict[str, Any], vedio_public_url: str) -> None:
+    """
+    将处理结果写入/更新 BQ_TABLE_2：
+    - 用 BQ2_KEY_FIELD 定位行
+    - 更新 BQ2_UPDATE_FIELD（默认 resaved_video_path）为 vedio_public_url
+
+    这里用 UPDATE（不会新增行），更符合“回填你的原有爬取数据表字段”的场景。
+    """
+    key_val = _get_key_val(payload, BQ2_KEY_FIELD)
+    table2_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_2}"
+
+    query = f"""
+    UPDATE `{table2_id}`
+    SET {BQ2_UPDATE_FIELD} = @vedio_public_url
+    WHERE {BQ2_KEY_FIELD} = @key_val
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("key_val", "STRING", str(key_val)),
+            bigquery.ScalarQueryParameter("vedio_public_url", "STRING", vedio_public_url or ""),
+        ]
+    )
+
     bq_client.query(query, job_config=job_config).result()
 
 
@@ -352,86 +407,75 @@ def parse_pubsub_push(req_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     解析 Pub/Sub push body，把 message.data 的 base64 JSON 解出来。
     """
-    # 取出 message 字段
     msg = (req_json or {}).get("message") or {}
-    # 取出 data（base64 字符串）
     data_b64 = msg.get("data")
-    # 没有 data 说明请求体不合法
     if not data_b64:
         raise ValueError("Missing message.data")
 
-    # base64 解码为 bytes，再 decode 成 utf-8 文本
     decoded = base64.b64decode(data_b64).decode("utf-8")
-    # JSON 反序列化为 dict
     payload = json.loads(decoded)
 
-    # 兼容字段命名：如果上游叫 videoUrl，就映射成 video_url
     if "video_url" not in payload:
         if "videoUrl" in payload:
             payload["video_url"] = payload["videoUrl"]
 
-    # 返回业务 payload
     return payload
 
 
 @app.get("/healthz")
 def healthz():
-    # 健康检查接口，方便你在 Cloud Run / 监控里探活
     return jsonify({"ok": True, "time": _now_iso()}), 200
 
 
 @app.post("/pubsub/push")
 def pubsub_push():
-    # 如果你启用了共享密钥，则检查 header，防止陌生来源直接打你的 endpoint
     if SHARED_SECRET:
         got = request.headers.get("X-Shared-Secret")
         if got != SHARED_SECRET:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    # 解析请求 JSON（silent=True 表示解析失败不会抛异常而是返回 None）
     req_json = request.get_json(silent=True) or {}
     try:
-        # 将 Pub/Sub push body 转成业务 payload
         payload = parse_pubsub_push(req_json)
     except Exception as e:
-        # payload 不合法：直接返回 204，让这条消息丢弃（避免 Pub/Sub 一直重试“坏消息”）
         return jsonify({"ok": False, "error": f"bad_payload: {e}"}), 204
 
-    # 从 payload 取出 video_url（必须字段）
     video_url = payload.get("video_url")
     if not video_url:
-        # 缺 video_url 也没法处理：返回 204 丢弃
         return jsonify({"ok": False, "error": "missing video_url"}), 204
 
-    # 如果上游指定了 gcs_object，就用它；否则根据元数据构造对象路径
     object_name = payload.get("gcs_object") or build_object_name(payload)
 
-    # Upload + BQ with retry on transient GCS errors
     last_err = None
-    # 这里做的是“消息处理级重试”：针对 GCS 429/503 等暂时性问题
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # 执行下载->上传
             up = upload_stream_to_gcs(video_url, object_name)
 
-            # 如果下载阶段已判定为永久失败（例如 404/403），写入 BQ failed 并 ack（返回 200）
+            # 永久失败：写入 BQ_TABLE failed，并 ack
             if not up.get("ok"):
-                upsert_bigquery(payload, gcs_uri="", status="failed", error=up.get("error"))
+                upsert_bigquery(payload, gcs_uri="", status="failed", vedio_public_url="", error=up.get("error"))
                 return jsonify({"ok": True, "status": "failed", "error": up.get("error")}), 200
 
-            # 上传成功则拿到 gcs_uri
             gcs_uri = up["gcs_uri"]
-            # 如果是幂等跳过（文件已存在），记录不同 status，方便你识别重复消息
+            final_object_name = up.get("object_name") or object_name
+
+            # 新增：生成公网 URL（格式）
+            vedio_public_url = _gcs_public_url(GCS_BUCKET, final_object_name)
+
             status = "done" if not up.get("skipped") else "done_skipped"
-            # 写回 BQ 成功状态与 gcs_uri
-            upsert_bigquery(payload, gcs_uri=gcs_uri, status=status, error="")
-            # 返回 200 让 Pub/Sub ack（不会重试）
-            return jsonify({"ok": True, "status": status, "gcs_uri": gcs_uri}), 200
+
+            # 1) 写回 BQ_TABLE：新增 vedio_public_url 字段
+            upsert_bigquery(payload, gcs_uri=gcs_uri, status=status, vedio_public_url=vedio_public_url, error="")
+
+            # 2) 写回 BQ_TABLE_2：用主键更新 resaved_video_path（或你配置的字段）
+            update_bq_table_2(payload, vedio_public_url=vedio_public_url)
+
+            return jsonify(
+                {"ok": True, "status": status, "gcs_uri": gcs_uri, "vedio_public_url": vedio_public_url}
+            ), 200
 
         except (TooManyRequests, ServiceUnavailable) as e:
-            # 捕获 GCS 暂时性错误，保存并退避重试
             last_err = e
             _sleep_backoff(attempt)
 
-    # 如果多次重试仍失败：返回 500，让 Pub/Sub 自动重试这条消息
     return jsonify({"ok": False, "error": f"transient_failure: {last_err!r}"}), 500
