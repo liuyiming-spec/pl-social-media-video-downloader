@@ -181,7 +181,7 @@ def build_video_object_name(payload: Dict[str, Any]) -> str:
 
     prefix = _normalize_prefix(GCS_PREFIX)
     # 原逻辑：raw/instagram/{author}/{date}/{vid}.mp4
-    return f"{prefix}instagram/{author}/{date_str}/{filename}"
+    return f"{prefix}instagram/{author}/{date_str}/video/{filename}"
 
 
 def build_image_object_name(payload: Dict[str, Any]) -> str:
