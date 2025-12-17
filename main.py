@@ -42,16 +42,6 @@ BQ_TABLE = os.environ["BQ_TABLE"]
 # BigQuery 的主键字段名（可选；默认 uuid；用于 MERGE 的 ON 条件）
 BQ_KEY_FIELD = os.getenv("BQ_KEY_FIELD", "uuid")
 
-# ===== 新增：第二张表（你的爬取数据表，用来回填 resaved_video_path） =====
-# 第二张 BigQuery 表名（必须：因为你明确要写入另外一张表）
-BQ_TABLE_2 = os.environ["BQ_TABLE_2"]
-
-# 第二张表的主键字段名（可选；默认沿用 BQ_KEY_FIELD）
-BQ2_KEY_FIELD = os.getenv("BQ2_KEY_FIELD", BQ_KEY_FIELD)
-
-# 第二张表被更新的字段名（可选；默认 resaved_video_path）
-BQ2_UPDATE_FIELD = os.getenv("BQ2_UPDATE_FIELD", "resaved_video_path")
-
 # 可选：简单共享密钥，用于防止别的来源直接调用你的 endpoint（生产建议用 OIDC/IAM 更标准）
 SHARED_SECRET = os.getenv("SHARED_SECRET")
 
@@ -376,42 +366,6 @@ def upsert_bigquery(
     bq_client.query(query, job_config=job_config).result()
 
 
-def update_bq_table_2(payload: Dict[str, Any], video_public_url: str) -> None:
-    """
-    将处理结果写入/更新 BQ_TABLE_2：
-    - 用 BQ2_KEY_FIELD 定位行
-    - 更新 BQ2_UPDATE_FIELD（默认 resaved_video_path）为 video_public_url
-
-    用 MERGE（只 UPDATE MATCHED，不插入），避免 UPDATE 扫描/并发时更容易超时的问题。
-    """
-    key_val = _get_key_val(payload, BQ2_KEY_FIELD)
-    table2_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE_2}"
-
-    query = f"""
-    MERGE `{table2_id}` T
-    USING (
-      SELECT
-        @key_val AS {BQ2_KEY_FIELD},
-        @video_public_url AS {BQ2_UPDATE_FIELD}
-    ) S
-    ON T.{BQ2_KEY_FIELD} = S.{BQ2_KEY_FIELD}
-    WHEN MATCHED THEN
-      UPDATE SET
-        {BQ2_UPDATE_FIELD} = S.{BQ2_UPDATE_FIELD}
-    """
-
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("key_val", "STRING", str(key_val)),
-            bigquery.ScalarQueryParameter("video_public_url", "STRING", video_public_url or ""),
-        ]
-    )
-
-    bq_client.query(query, job_config=job_config).result()
-
-
-
-
 def parse_pubsub_push(req_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     解析 Pub/Sub push body，把 message.data 的 base64 JSON 解出来。
@@ -475,9 +429,6 @@ def pubsub_push():
 
             # 1) 写回 BQ_TABLE：新增 video_public_url 字段
             upsert_bigquery(payload, gcs_uri=gcs_uri, status=status, video_public_url=video_public_url, error="")
-
-            # 2) 写回 BQ_TABLE_2：用主键更新 resaved_video_path（或你配置的字段）
-            update_bq_table_2(payload, video_public_url=video_public_url)
 
             return jsonify(
                 {"ok": True, "status": status, "gcs_uri": gcs_uri, "video_public_url": video_public_url}
