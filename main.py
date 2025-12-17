@@ -39,8 +39,8 @@ BQ_DATASET = os.environ["BQ_DATASET"]
 # BigQuery 表名（必须）
 BQ_TABLE = os.environ["BQ_TABLE"]
 
-# BigQuery 的主键字段名（可选；默认 post_id；用于 MERGE 的 ON 条件）
-BQ_KEY_FIELD = os.getenv("BQ_KEY_FIELD", "post_id")
+# BigQuery 的主键字段名（可选；默认 uuid；用于 MERGE 的 ON 条件）
+BQ_KEY_FIELD = os.getenv("BQ_KEY_FIELD", "uuid")
 
 # ===== 新增：第二张表（你的爬取数据表，用来回填 resaved_video_path） =====
 # 第二张 BigQuery 表名（必须：因为你明确要写入另外一张表）
@@ -153,9 +153,9 @@ def _gcs_public_url(bucket: str, object_name: str) -> str:
 
 def _get_key_val(payload: Dict[str, Any], key_field: str) -> str:
     """
-    统一取主键值：优先 payload[key_field]，再 fallback 到 post_id/shortcode/id，再兜底 url hash。
+    统一取主键值：优先 payload[key_field]，再 fallback 到 uuid/shortcode/id，再兜底 url hash。
     """
-    key_val = payload.get(key_field) or payload.get("post_id") or payload.get("shortcode") or payload.get("id")
+    key_val = payload.get(key_field) or payload.get("uuid") or payload.get("shortcode") or payload.get("id")
     if not key_val:
         key_val = f"noid-{abs(hash(payload.get('video_url', '')))}"
     return str(key_val)
@@ -165,8 +165,8 @@ def build_object_name(payload: Dict[str, Any]) -> str:
     """
     根据 payload 构造 GCS 对象路径（核心：幂等 + 可追踪）。
     """
-    # 优先使用 post_id/shortcode/id 作为唯一标识，方便去重
-    vid = payload.get("post_id") or payload.get("shortcode") or payload.get("id")
+    # 优先使用 uuid/shortcode/id 作为唯一标识，方便去重
+    vid = payload.get("uuid") or payload.get("shortcode") or payload.get("id")
     # 如果完全没有唯一 ID，则用 URL 的 hash 做兜底（不完美，但保证稳定）
     if not vid:
         vid = f"noid-{abs(hash(payload.get('video_url', '')))}"
