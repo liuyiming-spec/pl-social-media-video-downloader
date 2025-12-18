@@ -1,4 +1,3 @@
-# 标准库：base64 用来解 Pub/Sub 的 data；datetime 用来生成时间字段；json 解析/生成 JSON；os 读环境变量；random/time 做退避重试；typing 做类型提示
 import base64
 import datetime as dt
 import json
@@ -8,82 +7,51 @@ import time
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
-# 第三方：requests 用于拉取媒体流；Flask 用来做 Cloud Run 的 HTTP 服务入口
 import requests
 from flask import Flask, request, jsonify
 
-# GCP SDK：storage 操作 GCS；bigquery 操作 BQ；exceptions 用于捕获幂等/限流等异常
 from google.cloud import storage
 from google.cloud import bigquery
 from google.api_core.exceptions import PreconditionFailed, TooManyRequests, ServiceUnavailable
 
-# 创建 Flask 应用对象（Cloud Run 通过 HTTP 请求调用它）
 app = Flask(__name__)
 
 # ---------------------------
 # Env config (Cloud Run)
 # ---------------------------
-
-# 目标 GCS bucket 名称（必须配置，否则服务启动就会 KeyError）
 GCS_BUCKET = os.environ["GCS_BUCKET"]
-
-# GCS 路径前缀（可选；比如 raw/ 或 videos/；默认 raw/）
 GCS_PREFIX = os.getenv("GCS_PREFIX", "raw/")
 
-# BigQuery 项目 ID（必须；用于定位表）
 BQ_PROJECT = os.environ["BQ_PROJECT"]
-
-# BigQuery 数据集名称（必须）
 BQ_DATASET = os.environ["BQ_DATASET"]
-
-# BigQuery 表名（必须）
 BQ_TABLE = os.environ["BQ_TABLE"]
-
-# BigQuery 的主键字段名（可选；默认 uuid；用于 MERGE 的 ON 条件）
 BQ_KEY_FIELD = os.getenv("BQ_KEY_FIELD", "uuid")
 
-# 可选：简单共享密钥，用于防止别的来源直接调用你的 endpoint（生产建议用 OIDC/IAM 更标准）
 SHARED_SECRET = os.getenv("SHARED_SECRET")
 
-# 下载时使用的 User-Agent（有些源站会根据 UA 返回不同结果；默认给一个常见浏览器 UA）
 DEFAULT_UA = os.getenv(
     "DOWNLOADER_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 )
 
-# 下载超时时间（秒）；大文件一般不会在 handshake 上太久，这里控制请求层超时
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
-
-# 下载/上传重试次数（包含网络波动、429/503 等）
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-
-# GCS 可恢复上传分块大小（MB）；越大上传效率可能更高，但内存/网络波动风险也更大
 GCS_CHUNK_MB = int(os.getenv("GCS_CHUNK_MB", "8"))
-
-# 是否允许覆盖同名对象；默认 false 表示幂等：如果对象已存在就跳过
 OVERWRITE = os.getenv("OVERWRITE", "false").lower() == "true"
 
-# 创建 GCS 客户端（使用 Cloud Run 的服务账号身份或 GOOGLE_APPLICATION_CREDENTIALS 指定的身份）
 storage_client = storage.Client()
-
-# 创建 BigQuery 客户端（同上）
 bq_client = bigquery.Client(project=BQ_PROJECT)
 
-# 定义“可重试”的 HTTP 状态码：这些通常是暂时性问题（超时/限流/服务端错误）
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
-
-# 定义“不可重试”的 HTTP 状态码：这些多为永久性失败（权限/不存在等）
 NONRETRYABLE_STATUS = {400, 401, 403, 404, 410}
 
 
 def _now_iso() -> str:
-    # 返回 UTC 当前时间的 ISO 字符串（带时区），用于健康检查或日志输出
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
 
 
 def _sleep_backoff(attempt: int) -> None:
-    # 指数退避 + 抖动：attempt=1 等 ~1s；attempt=2 等 ~2s；……最大 60s
     delay = min(60.0, (2 ** (attempt - 1)) + random.random())
     time.sleep(delay)
 
@@ -107,11 +75,6 @@ def _date_folder(ts: Any) -> str:
 
 
 def _infer_ext(content_type: Optional[str], media_type: str) -> str:
-    """
-    根据 Content-Type 推断后缀：
-    - video: mp4/webm/mov（保持你原逻辑）
-    - image: jpg/png/gif/webp/svg
-    """
     if not content_type:
         return ".mp4" if media_type == "video" else ".jpg"
 
@@ -126,7 +89,6 @@ def _infer_ext(content_type: Optional[str], media_type: str) -> str:
             return ".mov"
         return ".mp4"
 
-    # image
     if ct in ("image/jpeg", "image/jpg"):
         return ".jpg"
     if ct == "image/png":
@@ -137,27 +99,11 @@ def _infer_ext(content_type: Optional[str], media_type: str) -> str:
         return ".webp"
     if ct == "image/svg+xml":
         return ".svg"
-    # 不认识的也给 jpg
     return ".jpg"
 
 
 def _gcs_public_url(bucket: str, object_name: str) -> str:
-    """
-    生成 GCS 的公网 URL 形式（不保证一定可访问，取决于 bucket/object ACL/IAM）。
-    """
     return f"https://storage.googleapis.com/{bucket}/{quote(object_name, safe='/')}"
-
-
-def _get_key_val(payload: Dict[str, Any], key_field: str) -> str:
-    """
-    统一取主键值：优先 payload[key_field]，再 fallback 到 uuid/shortcode/id，再兜底 url hash。
-    """
-    key_val = payload.get(key_field) or payload.get("uuid") or payload.get("shortcode") or payload.get("id")
-    if not key_val:
-        # 兼容图片/视频：优先 media_url，再退到 video_url/image_url
-        u = payload.get("media_url") or payload.get("video_url") or payload.get("image_url") or ""
-        key_val = f"noid-{abs(hash(u))}"
-    return str(key_val)
 
 
 def _normalize_prefix(prefix: str) -> str:
@@ -167,10 +113,20 @@ def _normalize_prefix(prefix: str) -> str:
     return prefix
 
 
+def _get_key_val(payload: Dict[str, Any], key_field: str, fallback: Optional[str] = None) -> str:
+    """
+    主键：优先 payload[key_field]，再 fallback 到 uuid/shortcode/id，再兜底 fallback，再兜底 url hash。
+    """
+    key_val = payload.get(key_field) or payload.get("uuid") or payload.get("shortcode") or payload.get("id")
+    if not key_val and fallback:
+        key_val = fallback
+    if not key_val:
+        u = payload.get("media_url") or payload.get("video_url") or payload.get("image_url") or ""
+        key_val = f"noid-{abs(hash(u))}"
+    return str(key_val)
+
+
 def build_video_object_name(payload: Dict[str, Any]) -> str:
-    """
-    保持你原来的视频对象路径构造逻辑不变（重要：不影响已有数据路径）。
-    """
     vid = payload.get("uuid") or payload.get("shortcode") or payload.get("id")
     if not vid:
         vid = f"noid-{abs(hash(payload.get('video_url', '')))}"
@@ -180,23 +136,16 @@ def build_video_object_name(payload: Dict[str, Any]) -> str:
     filename = f"{vid}.mp4"
 
     prefix = _normalize_prefix(GCS_PREFIX)
-    # 原逻辑：raw/instagram/{author}/{date}/{vid}.mp4
     return f"{prefix}instagram/{author}/{date_str}/video/{filename}"
 
 
 def build_image_object_name(payload: Dict[str, Any]) -> str:
-    """
-    图片单独存储：在同一 author/date 下增加 images/ 子目录。
-    示例：raw/instagram/{author}/{date}/images/{uuid}.jpg
-    """
     img_id = payload.get("uuid") or payload.get("shortcode") or payload.get("id")
     if not img_id:
         img_id = f"noid-{abs(hash(payload.get('image_url', '') or payload.get('media_url', '') or ''))}"
 
     author = _safe_author(payload.get("author") or "unknown")
     date_str = _date_folder(payload.get("timestamp"))
-
-    # 先用 jpg，后续会按 Content-Type 自动替换
     filename = f"{img_id}.jpg"
 
     prefix = _normalize_prefix(GCS_PREFIX)
@@ -204,10 +153,6 @@ def build_image_object_name(payload: Dict[str, Any]) -> str:
 
 
 def http_get_stream(url: str) -> Tuple[requests.Response, str]:
-    """
-    发起可流式读取的 GET 请求；返回 (response, content_type)。
-    注意：调用方必须 r.close() 释放连接。
-    """
     headers = {"User-Agent": DEFAULT_UA, "Accept": "*/*", "Connection": "keep-alive"}
     session = requests.Session()
 
@@ -228,11 +173,6 @@ def http_get_stream(url: str) -> Tuple[requests.Response, str]:
 
 
 def upload_stream_to_gcs(media_url: str, object_name: str, media_type: str) -> Dict[str, Any]:
-    """
-    从 media_url 以流方式下载，并以流方式上传到 GCS。
-    media_type: "video" | "image"
-    返回 {ok, gcs_uri, skipped, object_name, content_type, ...}
-    """
     bucket = storage_client.bucket(GCS_BUCKET)
     blob = bucket.blob(object_name)
 
@@ -254,7 +194,6 @@ def upload_stream_to_gcs(media_url: str, object_name: str, media_type: str) -> D
     content_type_main = (content_type.split(";")[0].strip() if content_type else "")
     ext = _infer_ext(content_type_main, media_type)
 
-    # 根据真实类型修正后缀
     if not object_name.lower().endswith(ext):
         if "." in object_name.split("/")[-1]:
             object_name = object_name.rsplit(".", 1)[0] + ext
@@ -303,22 +242,30 @@ def upsert_bigquery(
     public_url: str,
     content_type: str,
     error: Optional[str] = None,
+    pubsub_message_id: Optional[str] = None,
+    http_status: Optional[int] = None,
 ) -> None:
     """
-    新逻辑：只保留一套字段（不再写 raw_video_url/raw_image_url/video_public_url/image_public_url）
-    表字段：
-      {BQ_KEY_FIELD}, media_type, source_url, gcs_uri, public_url, content_type,
-      status, author, src_timestamp, error, updated_at
+    meta 表字段建议：
+      uuid, media_type, source_url, gcs_uri, public_url, content_type,
+      status, author, src_timestamp, image_total, error, updated_at,
+      pubsub_message_id, http_status
     """
-    key_val = _get_key_val(payload, BQ_KEY_FIELD)
+    fallback_key = f"msg-{pubsub_message_id}" if pubsub_message_id else None
+    key_val = _get_key_val(payload, BQ_KEY_FIELD, fallback=fallback_key)
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
-    # 统一 source_url：优先 media_url，否则按 type 取 image_url/video_url
     source_url = (
         payload.get("media_url")
         or (payload.get("image_url") if media_type == "image" else payload.get("video_url"))
         or ""
     )
+
+    image_total = payload.get("image_total", payload.get("img_total"))
+    try:
+        image_total = int(image_total) if image_total is not None and str(image_total).strip() != "" else None
+    except Exception:
+        image_total = None
 
     query = f"""
     MERGE `{table_id}` T
@@ -333,22 +280,28 @@ def upsert_bigquery(
         @status AS status,
         @author AS author,
         @src_timestamp AS src_timestamp,
+        @image_total AS image_total,
         @error AS error,
+        @pubsub_message_id AS pubsub_message_id,
+        @http_status AS http_status,
         CURRENT_TIMESTAMP() AS updated_at
     ) S
     ON T.{BQ_KEY_FIELD} = S.{BQ_KEY_FIELD}
     WHEN MATCHED THEN
       UPDATE SET
-        media_type   = S.media_type,
-        source_url   = S.source_url,
-        gcs_uri      = S.gcs_uri,
-        public_url   = S.public_url,
-        content_type = S.content_type,
-        status       = S.status,
-        author       = S.author,
-        src_timestamp= S.src_timestamp,
-        error        = S.error,
-        updated_at   = S.updated_at
+        media_type       = S.media_type,
+        source_url       = S.source_url,
+        gcs_uri          = S.gcs_uri,
+        public_url       = S.public_url,
+        content_type     = S.content_type,
+        status           = S.status,
+        author           = S.author,
+        src_timestamp    = S.src_timestamp,
+        image_total      = S.image_total,
+        error            = S.error,
+        pubsub_message_id= S.pubsub_message_id,
+        http_status      = S.http_status,
+        updated_at       = S.updated_at
     WHEN NOT MATCHED THEN
       INSERT (
         {BQ_KEY_FIELD},
@@ -360,7 +313,10 @@ def upsert_bigquery(
         status,
         author,
         src_timestamp,
+        image_total,
         error,
+        pubsub_message_id,
+        http_status,
         updated_at
       )
       VALUES (
@@ -373,7 +329,10 @@ def upsert_bigquery(
         S.status,
         S.author,
         S.src_timestamp,
+        S.image_total,
         S.error,
+        S.pubsub_message_id,
+        S.http_status,
         S.updated_at
       )
     """
@@ -389,29 +348,39 @@ def upsert_bigquery(
             bigquery.ScalarQueryParameter("status", "STRING", status),
             bigquery.ScalarQueryParameter("author", "STRING", str(payload.get("author") or "")),
             bigquery.ScalarQueryParameter("src_timestamp", "STRING", str(payload.get("timestamp") or "")),
+            bigquery.ScalarQueryParameter("image_total", "INT64", image_total),
             bigquery.ScalarQueryParameter("error", "STRING", error or ""),
+            bigquery.ScalarQueryParameter("pubsub_message_id", "STRING", pubsub_message_id or ""),
+            bigquery.ScalarQueryParameter("http_status", "INT64", http_status),
         ]
     )
 
     bq_client.query(query, job_config=job_config).result()
 
 
-
-def parse_pubsub_push(req_json: Dict[str, Any]) -> Dict[str, Any]:
+def parse_pubsub_push_safe(req_json: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, str]:
     """
-    解析 Pub/Sub push body，把 message.data 的 base64 JSON 解出来。
-    同时做字段兼容：
-    - video_url/videoUrl
-    - image_url/imageUrl/img_url
-    - type: video/image（默认 video，保证旧消息不改也能跑）
+    返回：(payload_or_None, pubsub_message_id, error_or_empty)
     """
     msg = (req_json or {}).get("message") or {}
+    message_id = msg.get("messageId") or ""
     data_b64 = msg.get("data")
     if not data_b64:
-        raise ValueError("Missing message.data")
+        return None, message_id, "Missing message.data"
 
-    decoded = base64.b64decode(data_b64).decode("utf-8")
-    payload = json.loads(decoded)
+    try:
+        decoded = base64.b64decode(data_b64).decode("utf-8")
+    except Exception as e:
+        return None, message_id, f"Base64 decode error: {e!r}"
+
+    try:
+        payload = json.loads(decoded)
+    except Exception as e:
+        return None, message_id, f"JSON parse error: {e!r}"
+
+    # 兼容：img_total -> image_total
+    if "image_total" not in payload and "img_total" in payload:
+        payload["image_total"] = payload["img_total"]
 
     # type 兼容：默认 video
     media_type = (payload.get("type") or payload.get("media_type") or "video")
@@ -420,22 +389,22 @@ def parse_pubsub_push(req_json: Dict[str, Any]) -> Dict[str, Any]:
         media_type = "video"
     payload["type"] = media_type
 
-    # 视频 URL 兼容
+    # video_url 兼容
     if "video_url" not in payload and "videoUrl" in payload:
         payload["video_url"] = payload["videoUrl"]
 
-    # 图片 URL 兼容
+    # image_url 兼容
     if "image_url" not in payload:
         if "imageUrl" in payload:
             payload["image_url"] = payload["imageUrl"]
         elif "img_url" in payload:
             payload["image_url"] = payload["img_url"]
 
-    # 统一一个 media_url 便于兜底
+    # 统一 media_url
     if "media_url" not in payload:
         payload["media_url"] = payload.get("video_url") or payload.get("image_url") or ""
 
-    return payload
+    return payload, message_id, ""
 
 
 @app.get("/healthz")
@@ -445,40 +414,90 @@ def healthz():
 
 @app.post("/pubsub/push")
 def pubsub_push():
+    # 1) auth：无论是否授权，都尽量落库（用于观测）
     if SHARED_SECRET:
         got = request.headers.get("X-Shared-Secret")
         if got != SHARED_SECRET:
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+            req_json = request.get_json(silent=True) or {}
+            payload, message_id, parse_err = parse_pubsub_push_safe(req_json)
+            # 落库一条 unauthorized（payload 可能 None）
+            upsert_bigquery(
+                payload or {},
+                media_type=(payload or {}).get("type") or "unknown",
+                gcs_uri="",
+                status="unauthorized",
+                public_url="",
+                content_type="",
+                error=parse_err or "unauthorized",
+                pubsub_message_id=message_id,
+                http_status=401,
+            )
+            # ack（不要让 Pub/Sub 重试放大噪音）
+            return jsonify({"ok": False, "error": "unauthorized"}), 200
 
     req_json = request.get_json(silent=True) or {}
-    try:
-        payload = parse_pubsub_push(req_json)
-    except Exception as e:
-        # Pub/Sub push：204 代表 ack（不重试），这里保持你原风格
-        return jsonify({"ok": False, "error": f"bad_payload: {e}"}), 204
+    payload, message_id, parse_err = parse_pubsub_push_safe(req_json)
 
-    media_type = payload.get("type") or "video"
-    media_type = str(media_type).strip().lower()
+    # 2) bad payload：也落库（用 message_id 做 fallback key）
+    if payload is None:
+        upsert_bigquery(
+            {},
+            media_type="unknown",
+            gcs_uri="",
+            status="bad_payload",
+            public_url="",
+            content_type="",
+            error=parse_err,
+            pubsub_message_id=message_id,
+            http_status=200,
+        )
+        return jsonify({"ok": True, "status": "bad_payload"}), 200
 
-    # 根据 type 选择 URL
+    media_type = (payload.get("type") or "video").strip().lower()
+    if media_type not in ("video", "image"):
+        media_type = "video"
+
+    # 3) missing url：也落库（以前你是 204 直接丢）
     if media_type == "image":
         media_url = payload.get("image_url") or payload.get("media_url")
         if not media_url:
-            return jsonify({"ok": False, "error": "missing image_url"}), 204
+            upsert_bigquery(
+                payload,
+                media_type="image",
+                gcs_uri="",
+                status="missing_url",
+                public_url="",
+                content_type="",
+                error="missing image_url",
+                pubsub_message_id=message_id,
+                http_status=200,
+            )
+            return jsonify({"ok": True, "status": "missing_url"}), 200
         object_name = payload.get("gcs_object") or build_image_object_name(payload)
     else:
-        # 默认 video：保持原逻辑
         media_url = payload.get("video_url") or payload.get("media_url")
         if not media_url:
-            return jsonify({"ok": False, "error": "missing video_url"}), 204
+            upsert_bigquery(
+                payload,
+                media_type="video",
+                gcs_uri="",
+                status="missing_url",
+                public_url="",
+                content_type="",
+                error="missing video_url",
+                pubsub_message_id=message_id,
+                http_status=200,
+            )
+            return jsonify({"ok": True, "status": "missing_url"}), 200
         object_name = payload.get("gcs_object") or build_video_object_name(payload)
 
-    last_err = None
+    # 4) 正常下载：成功/失败都落库；transient 最终失败也落库
+    last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             up = upload_stream_to_gcs(media_url, object_name, media_type=media_type)
 
-            # 永久失败：写入 BQ failed，并 ack
+            # 永久失败：落库 failed，并 ack
             if not up.get("ok"):
                 upsert_bigquery(
                     payload,
@@ -488,6 +507,8 @@ def pubsub_push():
                     public_url="",
                     content_type="",
                     error=up.get("error"),
+                    pubsub_message_id=message_id,
+                    http_status=200,
                 )
                 return jsonify({"ok": True, "status": "failed", "error": up.get("error")}), 200
 
@@ -498,7 +519,6 @@ def pubsub_push():
 
             status = "done" if not up.get("skipped") else "done_skipped"
 
-            # 写回 BQ：同一张表，按 media_type 分别填充字段
             upsert_bigquery(
                 payload,
                 media_type=media_type,
@@ -507,9 +527,10 @@ def pubsub_push():
                 public_url=public_url,
                 content_type=content_type,
                 error="",
+                pubsub_message_id=message_id,
+                http_status=200,
             )
 
-            # 返回响应（便于你手动测试）
             return jsonify(
                 {
                     "ok": True,
@@ -525,4 +546,21 @@ def pubsub_push():
             last_err = e
             _sleep_backoff(attempt)
 
-    return jsonify({"ok": False, "error": f"transient_failure: {last_err!r}"}), 500
+        except Exception as e:
+            # 其他未知异常也算 transient
+            last_err = e
+            _sleep_backoff(attempt)
+
+    # transient 最终失败：以前你这里直接 500 不落库；现在落库
+    upsert_bigquery(
+        payload,
+        media_type=media_type,
+        gcs_uri="",
+        status="transient_failed",
+        public_url="",
+        content_type="",
+        error=f"transient_failure: {last_err!r}",
+        pubsub_message_id=message_id,
+        http_status=200,
+    )
+    return jsonify({"ok": True, "status": "transient_failed"}), 200
